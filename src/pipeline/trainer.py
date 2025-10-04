@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -17,12 +18,15 @@ from src.models.lstm_model import BidirectionalLSTM
 from src.pipeline.dataset import SequenceConfig, SequenceDataset, build_sequences
 
 
+logger = logging.getLogger(__name__)
+
+
 @dataclass
 class TrainerConfig:
     epochs: int = 30
     batch_size: int = 32
     learning_rate: float = 1e-3
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = "auto"
 
 
 @dataclass
@@ -42,6 +46,33 @@ class LSTMTrainer:
         self.sequence_config = sequence_config
         self.trainer_config = trainer_config
         self.artifact_paths = artifact_paths
+        self.device = self._resolve_device(trainer_config.device)
+
+    def _resolve_device(self, configured_device: str) -> str:
+        """Return a valid device string, defaulting to CPU when necessary."""
+
+        if configured_device == "auto":
+            resolved = "cuda" if torch.cuda.is_available() else "cpu"
+            logger.info("Auto-selected device: %s", resolved)
+            return resolved
+
+        try:
+            device = torch.device(configured_device)
+        except (RuntimeError, ValueError):
+            logger.warning(
+                "Requested device '%s' is not available. Falling back to CPU.",
+                configured_device,
+            )
+            return "cpu"
+
+        if device.type == "cuda" and not torch.cuda.is_available():
+            logger.warning(
+                "CUDA requested via '%s' but no GPU is available. Falling back to CPU.",
+                configured_device,
+            )
+            return "cpu"
+
+        return configured_device
 
     def _prepare_sequences(
         self, data: np.ndarray, target: np.ndarray
@@ -74,6 +105,7 @@ class LSTMTrainer:
         return train_loader, test_loader
 
     def train(self, raw_df) -> Dict[str, float]:
+        logger.info("Starting training run")
         df = add_technical_features(raw_df)
         feature_columns = [
             "open",
@@ -95,13 +127,35 @@ class LSTMTrainer:
         scaled_target = target_scaler.fit_transform(target.values).squeeze()
 
         sequences, targets = self._prepare_sequences(scaled_features, scaled_target)
+        logger.debug(
+            "Prepared sequences with shape %s and targets shape %s",
+            sequences.shape,
+            targets.shape,
+        )
         train_dataset, test_dataset = self._split_dataset(sequences, targets)
+        logger.info(
+            "Split dataset into %d training samples and %d evaluation samples",
+            len(train_dataset),
+            len(test_dataset),
+        )
         train_loader, test_loader = self._create_dataloaders(train_dataset, test_dataset)
 
         model = BidirectionalLSTM(
             input_size=sequences.shape[-1],
             output_size=self.sequence_config.horizon,
-        ).to(self.trainer_config.device)
+        )
+
+        try:
+            model = model.to(self.device)
+        except RuntimeError:
+            logger.exception(
+                "Unable to move model to requested device '%s'. Falling back to CPU.",
+                self.device,
+            )
+            self.device = "cpu"
+            model = model.to(self.device)
+        else:
+            logger.info("Model initialized on device %s", self.device)
 
         criterion = torch.nn.MSELoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=self.trainer_config.learning_rate)
@@ -110,8 +164,8 @@ class LSTMTrainer:
             model.train()
             running_loss = 0.0
             for batch_features, batch_targets in train_loader:
-                batch_features = batch_features.to(self.trainer_config.device)
-                batch_targets = batch_targets.to(self.trainer_config.device)
+                batch_features = batch_features.to(self.device)
+                batch_targets = batch_targets.to(self.device)
 
                 optimizer.zero_grad()
                 outputs = model(batch_features)
@@ -121,15 +175,22 @@ class LSTMTrainer:
                 running_loss += loss.item() * batch_features.size(0)
 
             epoch_loss = running_loss / len(train_loader.dataset)
-            print(f"Epoch {epoch + 1}/{self.trainer_config.epochs} - Loss: {epoch_loss:.4f}")
+            logger.info(
+                "Epoch %d/%d - Loss: %.4f",
+                epoch + 1,
+                self.trainer_config.epochs,
+                epoch_loss,
+            )
 
         metrics = self.evaluate(model, test_loader, target_scaler)
+        logger.info("Evaluation metrics: %s", metrics)
 
         # Persist artifacts
         self.artifact_paths.model_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(model.state_dict(), self.artifact_paths.model_path)
         joblib.dump(feature_scaler, self.artifact_paths.feature_scaler_path)
         joblib.dump(target_scaler, self.artifact_paths.target_scaler_path)
+        logger.info("Saved model and scalers to disk")
 
         return metrics
 
@@ -140,11 +201,16 @@ class LSTMTrainer:
         predictions = []
         actuals = []
         with torch.no_grad():
-            for features, targets in data_loader:
-                features = features.to(self.trainer_config.device)
+            for batch_idx, (features, targets) in enumerate(data_loader, start=1):
+                features = features.to(self.device)
                 outputs = model(features)
                 predictions.append(outputs.cpu().numpy())
                 actuals.append(targets.numpy())
+                logger.debug(
+                    "Processed evaluation batch %d/%d",
+                    batch_idx,
+                    len(data_loader),
+                )
 
         pred_array = np.concatenate(predictions, axis=0)
         actual_array = np.concatenate(actuals, axis=0)
