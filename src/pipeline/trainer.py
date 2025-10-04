@@ -22,7 +22,7 @@ class TrainerConfig:
     epochs: int = 30
     batch_size: int = 32
     learning_rate: float = 1e-3
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = "auto"
 
 
 @dataclass
@@ -42,6 +42,29 @@ class LSTMTrainer:
         self.sequence_config = sequence_config
         self.trainer_config = trainer_config
         self.artifact_paths = artifact_paths
+        self.device = self._resolve_device(trainer_config.device)
+
+    def _resolve_device(self, configured_device: str) -> str:
+        """Return a valid device string, defaulting to CPU when necessary."""
+
+        if configured_device == "auto":
+            return "cuda" if torch.cuda.is_available() else "cpu"
+
+        try:
+            device = torch.device(configured_device)
+        except (RuntimeError, ValueError):
+            print(
+                f"Warning: Requested device '{configured_device}' is not available. Falling back to CPU."
+            )
+            return "cpu"
+
+        if device.type == "cuda" and not torch.cuda.is_available():
+            print(
+                f"Warning: CUDA requested via '{configured_device}' but no GPU is available. Falling back to CPU."
+            )
+            return "cpu"
+
+        return configured_device
 
     def _prepare_sequences(
         self, data: np.ndarray, target: np.ndarray
@@ -101,7 +124,17 @@ class LSTMTrainer:
         model = BidirectionalLSTM(
             input_size=sequences.shape[-1],
             output_size=self.sequence_config.horizon,
-        ).to(self.trainer_config.device)
+        )
+
+        try:
+            model = model.to(self.device)
+        except RuntimeError:
+            print(
+                "Warning: Unable to move model to the requested device. "
+                "Falling back to CPU."
+            )
+            self.device = "cpu"
+            model = model.to(self.device)
 
         criterion = torch.nn.MSELoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=self.trainer_config.learning_rate)
@@ -110,8 +143,8 @@ class LSTMTrainer:
             model.train()
             running_loss = 0.0
             for batch_features, batch_targets in train_loader:
-                batch_features = batch_features.to(self.trainer_config.device)
-                batch_targets = batch_targets.to(self.trainer_config.device)
+                batch_features = batch_features.to(self.device)
+                batch_targets = batch_targets.to(self.device)
 
                 optimizer.zero_grad()
                 outputs = model(batch_features)
@@ -141,7 +174,7 @@ class LSTMTrainer:
         actuals = []
         with torch.no_grad():
             for features, targets in data_loader:
-                features = features.to(self.trainer_config.device)
+                features = features.to(self.device)
                 outputs = model(features)
                 predictions.append(outputs.cpu().numpy())
                 actuals.append(targets.numpy())
