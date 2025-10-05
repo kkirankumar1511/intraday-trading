@@ -18,7 +18,9 @@ from src.models.lstm_model import BidirectionalLSTM
 from src.pipeline.dataset import SequenceConfig, SequenceDataset, build_sequences
 
 
-logger = logging.getLogger(__name__)
+def _print(level: str, message: str, *args) -> None:
+    formatted = message % args if args else message
+    print(f"[{level}] {formatted}")
 
 
 @dataclass
@@ -53,20 +55,22 @@ class LSTMTrainer:
 
         if configured_device == "auto":
             resolved = "cuda" if torch.cuda.is_available() else "cpu"
-            logger.info("Auto-selected device: %s", resolved)
+            _print("INFO", "Auto-selected device: %s", resolved)
             return resolved
 
         try:
             device = torch.device(configured_device)
         except (RuntimeError, ValueError):
-            logger.warning(
+            _print(
+                "WARN",
                 "Requested device '%s' is not available. Falling back to CPU.",
                 configured_device,
             )
             return "cpu"
 
         if device.type == "cuda" and not torch.cuda.is_available():
-            logger.warning(
+            _print(
+                "WARN",
                 "CUDA requested via '%s' but no GPU is available. Falling back to CPU.",
                 configured_device,
             )
@@ -105,7 +109,7 @@ class LSTMTrainer:
         return train_loader, test_loader
 
     def train(self, raw_df) -> Dict[str, float]:
-        logger.info("Starting training run")
+        _print("INFO", "Starting training run")
         df = add_technical_features(raw_df)
         feature_columns = [
             "open",
@@ -127,13 +131,15 @@ class LSTMTrainer:
         scaled_target = target_scaler.fit_transform(target.values).squeeze()
 
         sequences, targets = self._prepare_sequences(scaled_features, scaled_target)
-        logger.debug(
+        _print(
+            "DEBUG",
             "Prepared sequences with shape %s and targets shape %s",
             sequences.shape,
             targets.shape,
         )
         train_dataset, test_dataset = self._split_dataset(sequences, targets)
-        logger.info(
+        _print(
+            "INFO",
             "Split dataset into %d training samples and %d evaluation samples",
             len(train_dataset),
             len(test_dataset),
@@ -147,15 +153,17 @@ class LSTMTrainer:
 
         try:
             model = model.to(self.device)
-        except RuntimeError:
-            logger.exception(
-                "Unable to move model to requested device '%s'. Falling back to CPU.",
+        except RuntimeError as exc:
+            _print(
+                "ERROR",
+                "Unable to move model to requested device '%s'. Falling back to CPU. Error: %s",
                 self.device,
+                exc,
             )
             self.device = "cpu"
             model = model.to(self.device)
         else:
-            logger.info("Model initialized on device %s", self.device)
+            _print("INFO", "Model initialized on device %s", self.device)
 
         criterion = torch.nn.MSELoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=self.trainer_config.learning_rate)
@@ -175,7 +183,8 @@ class LSTMTrainer:
                 running_loss += loss.item() * batch_features.size(0)
 
             epoch_loss = running_loss / len(train_loader.dataset)
-            logger.info(
+            _print(
+                "INFO",
                 "Epoch %d/%d - Loss: %.4f",
                 epoch + 1,
                 self.trainer_config.epochs,
@@ -183,14 +192,14 @@ class LSTMTrainer:
             )
 
         metrics = self.evaluate(model, test_loader, target_scaler)
-        logger.info("Evaluation metrics: %s", metrics)
+        _print("INFO", "Evaluation metrics: %s", metrics)
 
         # Persist artifacts
         self.artifact_paths.model_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(model.state_dict(), self.artifact_paths.model_path)
         joblib.dump(feature_scaler, self.artifact_paths.feature_scaler_path)
         joblib.dump(target_scaler, self.artifact_paths.target_scaler_path)
-        logger.info("Saved model and scalers to disk")
+        _print("INFO", "Saved model and scalers to disk")
 
         return metrics
 
@@ -198,7 +207,7 @@ class LSTMTrainer:
         self, model: BidirectionalLSTM, data_loader: DataLoader, target_scaler: StandardScaler
     ) -> Dict[str, float]:
         if len(data_loader.dataset) == 0:
-            logger.warning("Test dataset is empty; returning NaN metrics")
+            _print("WARN", "Test dataset is empty; returning NaN metrics")
             return {
                 "mse": float("nan"),
                 "mae": float("nan"),
@@ -215,7 +224,8 @@ class LSTMTrainer:
                 outputs = model(features)
                 predictions.append(outputs.cpu().numpy())
                 actuals.append(targets.numpy())
-                logger.debug(
+                _print(
+                    "DEBUG",
                     "Processed evaluation batch %d/%d",
                     batch_idx,
                     len(data_loader),
