@@ -34,6 +34,7 @@ class TrainerConfig:
     max_batches_per_epoch: Optional[int] = None
     early_stopping_patience: Optional[int] = 5
     improvement_threshold: float = 1e-4
+    max_training_sequences: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.epochs <= 0:
@@ -57,6 +58,11 @@ class TrainerConfig:
             raise ValueError("early_stopping_patience must be positive when provided")
         if self.improvement_threshold < 0:
             raise ValueError("improvement_threshold must be non-negative")
+        if (
+            self.max_training_sequences is not None
+            and self.max_training_sequences <= 0
+        ):
+            raise ValueError("max_training_sequences must be positive when provided")
 
 
 @dataclass
@@ -115,24 +121,40 @@ class LSTMTrainer:
         self, features: np.ndarray, targets: np.ndarray, split_ratio: float = 0.8
     ) -> Tuple[SequenceDataset, SequenceDataset]:
         split_index = int(len(features) * split_ratio)
-        train_dataset = SequenceDataset(features[:split_index], targets[:split_index])
+        train_features = features[:split_index]
+        train_targets = targets[:split_index]
+        limit = self.trainer_config.max_training_sequences
+        if limit is not None and len(train_features) > limit:
+            _print(
+                "INFO",
+                "Limiting training set to the most recent %d sequences (of %d total)",
+                limit,
+                len(train_features),
+            )
+            train_features = train_features[-limit:]
+            train_targets = train_targets[-limit:]
+
+        train_dataset = SequenceDataset(train_features, train_targets)
         test_dataset = SequenceDataset(features[split_index:], targets[split_index:])
         return train_dataset, test_dataset
 
     def _create_dataloaders(
         self, train_dataset: SequenceDataset, test_dataset: SequenceDataset
     ) -> Tuple[DataLoader, DataLoader]:
+        pin_memory = self.device == "cuda"
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.trainer_config.batch_size,
             shuffle=True,
             drop_last=False,
+            pin_memory=pin_memory,
         )
         test_loader = DataLoader(
             test_dataset,
             batch_size=self.trainer_config.batch_size,
             shuffle=False,
             drop_last=False,
+            pin_memory=pin_memory,
         )
         return train_loader, test_loader
 
@@ -155,8 +177,10 @@ class LSTMTrainer:
 
         feature_scaler = StandardScaler()
         target_scaler = StandardScaler()
-        scaled_features = feature_scaler.fit_transform(features.values)
-        scaled_target = target_scaler.fit_transform(target.values).squeeze()
+        scaled_features = feature_scaler.fit_transform(features.values).astype(np.float32)
+        scaled_target = (
+            target_scaler.fit_transform(target.values).astype(np.float32).squeeze()
+        )
 
         sequences, targets = self._prepare_sequences(scaled_features, scaled_target)
         if len(sequences) == 0:
@@ -177,6 +201,18 @@ class LSTMTrainer:
             sequences.shape,
             targets.shape,
         )
+        if len(sequences) == 0:
+            raise ValueError(
+                "Training dataset is empty after sequence generation. "
+                "Provide more historical data or decrease the lookback window."
+            )
+        _print(
+            "INFO",
+            "Generated %d total training sequences using stride %d",
+            len(sequences),
+            self.sequence_config.stride,
+        )
+
         train_dataset, test_dataset = self._split_dataset(sequences, targets)
         if len(train_dataset) == 0:
             raise ValueError(
