@@ -159,6 +159,18 @@ class LSTMTrainer:
         scaled_target = target_scaler.fit_transform(target.values).squeeze()
 
         sequences, targets = self._prepare_sequences(scaled_features, scaled_target)
+        if len(sequences) == 0:
+            required = self.sequence_config.lookback + self.sequence_config.horizon
+            raise ValueError(
+                "Unable to build any training sequences. The dataset only has %d rows "
+                "but requires at least %d rows for lookback=%d and horizon=%d."
+                % (
+                    len(df),
+                    required,
+                    self.sequence_config.lookback,
+                    self.sequence_config.horizon,
+                )
+            )
         _print(
             "DEBUG",
             "Prepared sequences with shape %s and targets shape %s",
