@@ -183,6 +183,18 @@ class LSTMTrainer:
         )
 
         sequences, targets = self._prepare_sequences(scaled_features, scaled_target)
+        if len(sequences) == 0:
+            required = self.sequence_config.lookback + self.sequence_config.horizon
+            raise ValueError(
+                "Unable to build any training sequences. The dataset only has %d rows "
+                "but requires at least %d rows for lookback=%d and horizon=%d."
+                % (
+                    len(df),
+                    required,
+                    self.sequence_config.lookback,
+                    self.sequence_config.horizon,
+                )
+            )
         _print(
             "DEBUG",
             "Prepared sequences with shape %s and targets shape %s",
@@ -202,6 +214,11 @@ class LSTMTrainer:
         )
 
         train_dataset, test_dataset = self._split_dataset(sequences, targets)
+        if len(train_dataset) == 0:
+            raise ValueError(
+                "Training dataset is empty after sequence generation. "
+                "Provide more historical data or decrease the lookback window."
+            )
         _print(
             "INFO",
             "Split dataset into %d training samples and %d evaluation samples",
