@@ -197,9 +197,18 @@ class LSTMTrainer:
     def evaluate(
         self, model: BidirectionalLSTM, data_loader: DataLoader, target_scaler: StandardScaler
     ) -> Dict[str, float]:
+        if len(data_loader.dataset) == 0:
+            logger.warning("Test dataset is empty; returning NaN metrics")
+            return {
+                "mse": float("nan"),
+                "mae": float("nan"),
+                "mape": float("nan"),
+                "directional_accuracy": float("nan"),
+            }
+
         model.eval()
-        predictions = []
-        actuals = []
+        predictions: list[np.ndarray] = []
+        actuals: list[np.ndarray] = []
         with torch.no_grad():
             for batch_idx, (features, targets) in enumerate(data_loader, start=1):
                 features = features.to(self.device)
@@ -215,8 +224,15 @@ class LSTMTrainer:
         pred_array = np.concatenate(predictions, axis=0)
         actual_array = np.concatenate(actuals, axis=0)
 
-        pred_rescaled = target_scaler.inverse_transform(pred_array)
-        actual_rescaled = target_scaler.inverse_transform(actual_array)
+        # The target scaler is fit on a single-column array, so we need to reshape
+        # the multi-step predictions and actuals before applying the inverse
+        # transformation.
+        pred_rescaled = target_scaler.inverse_transform(pred_array.reshape(-1, 1)).reshape(
+            pred_array.shape
+        )
+        actual_rescaled = target_scaler.inverse_transform(
+            actual_array.reshape(-1, 1)
+        ).reshape(actual_array.shape)
 
         mse = mean_squared_error(actual_rescaled, pred_rescaled)
         mae = mean_absolute_error(actual_rescaled, pred_rescaled)
