@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Dict, Tuple, cast
+
 import joblib
 import numpy as np
 import torch
@@ -31,12 +33,26 @@ class LSTMPredictor:
         self.feature_scaler = joblib.load(feature_scaler_path)
         self.target_scaler = joblib.load(target_scaler_path)
 
-        input_size = self.feature_scaler.mean_.shape[0]
+        state_dict, metadata = self._load_checkpoint(model_path)
+        trained_horizon = metadata.get("output_size", sequence_config.horizon)
+        if trained_horizon != sequence_config.horizon:
+            raise ValueError(
+                "Loaded model was trained for horizon %d but predictor configured for horizon %d."
+                % (trained_horizon, sequence_config.horizon)
+            )
+
+        input_size = metadata.get("input_size", self.feature_scaler.mean_.shape[0])
+        hidden_size = metadata.get("hidden_size", 128)
+        num_layers = metadata.get("num_layers", 3)
+        dropout = metadata.get("dropout", 0.2)
+
         self.model = BidirectionalLSTM(
             input_size=input_size,
-            output_size=sequence_config.horizon,
+            output_size=trained_horizon,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
         )
-        state_dict = torch.load(model_path, map_location=self.device)
         self.model.load_state_dict(state_dict)
         self.model.to(self.device)
         self.model.eval()
@@ -72,6 +88,33 @@ class LSTMPredictor:
 
         prediction = self.target_scaler.inverse_transform(scaled_prediction)
         return prediction.flatten()
+
+    def _load_checkpoint(self, model_path) -> Tuple[Dict[str, torch.Tensor], Dict[str, int | float]]:
+        checkpoint = torch.load(model_path, map_location=self.device)
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            metadata = cast(Dict[str, int | float], checkpoint.get("metadata", {}))
+            state_dict = cast(Dict[str, torch.Tensor], checkpoint["model_state_dict"])
+            return state_dict, metadata
+
+        state_dict = checkpoint
+        inferred_metadata: Dict[str, int | float] = {}
+
+        weight_ih_keys = [
+            key
+            for key in state_dict
+            if key.startswith("lstm.weight_ih_l") and "reverse" not in key
+        ]
+        if weight_ih_keys:
+            inferred_metadata["num_layers"] = len(weight_ih_keys)
+            first_weight = state_dict[weight_ih_keys[0]]
+            inferred_metadata["hidden_size"] = first_weight.shape[0] // 4
+            inferred_metadata["input_size"] = first_weight.shape[1]
+
+        fc_weight = state_dict.get("fc.3.weight")
+        if fc_weight is not None:
+            inferred_metadata["output_size"] = fc_weight.shape[0]
+
+        return state_dict, inferred_metadata
 
 
 __all__ = ["LSTMPredictor", "PredictorConfig"]
