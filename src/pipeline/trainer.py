@@ -20,7 +20,7 @@ from src.pipeline.dataset import SequenceConfig, SequenceDataset, build_sequence
 
 def _print(level: str, message: str, *args) -> None:
     formatted = message % args if args else message
-    print(f"[{level}] {formatted}")
+    print(f"[{level}] {formatted}", flush=True)
 
 
 @dataclass
@@ -138,6 +138,11 @@ class LSTMTrainer:
             targets.shape,
         )
         train_dataset, test_dataset = self._split_dataset(sequences, targets)
+        if len(train_dataset) == 0:
+            raise ValueError(
+                "Training dataset is empty after sequence generation. "
+                "Provide more historical data or decrease the lookback window."
+            )
         _print(
             "INFO",
             "Split dataset into %d training samples and %d evaluation samples",
@@ -168,10 +173,22 @@ class LSTMTrainer:
         criterion = torch.nn.MSELoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=self.trainer_config.learning_rate)
 
+        total_batches = len(train_loader)
+        log_interval = max(1, total_batches // 5) if total_batches else 1
+
         for epoch in range(self.trainer_config.epochs):
             model.train()
             running_loss = 0.0
-            for batch_features, batch_targets in train_loader:
+            _print(
+                "DEBUG",
+                "Epoch %d/%d - starting (%d batches)",
+                epoch + 1,
+                self.trainer_config.epochs,
+                total_batches,
+            )
+            for batch_idx, (batch_features, batch_targets) in enumerate(
+                train_loader, start=1
+            ):
                 batch_features = batch_features.to(self.device)
                 batch_targets = batch_targets.to(self.device)
 
@@ -181,6 +198,16 @@ class LSTMTrainer:
                 loss.backward()
                 optimizer.step()
                 running_loss += loss.item() * batch_features.size(0)
+
+                if batch_idx % log_interval == 0 or batch_idx == total_batches:
+                    _print(
+                        "DEBUG",
+                        "Epoch %d/%d - processed %d/%d batches",
+                        epoch + 1,
+                        self.trainer_config.epochs,
+                        batch_idx,
+                        total_batches,
+                    )
 
             epoch_loss = running_loss / len(train_loader.dataset)
             _print(
