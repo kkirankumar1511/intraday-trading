@@ -363,7 +363,17 @@ class LSTMTrainer:
 
         # Persist artifacts
         self.artifact_paths.model_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(model.state_dict(), self.artifact_paths.model_path)
+        checkpoint = {
+            "model_state_dict": model.state_dict(),
+            "metadata": {
+                "input_size": sequences.shape[-1],
+                "output_size": self.sequence_config.horizon,
+                "hidden_size": self.trainer_config.hidden_size,
+                "num_layers": self.trainer_config.num_layers,
+                "dropout": self.trainer_config.dropout,
+            },
+        }
+        torch.save(checkpoint, self.artifact_paths.model_path)
         joblib.dump(feature_scaler, self.artifact_paths.feature_scaler_path)
         joblib.dump(target_scaler, self.artifact_paths.target_scaler_path)
         _print("INFO", "Saved model and scalers to disk")
