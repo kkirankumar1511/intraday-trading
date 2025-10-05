@@ -2,9 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import logging
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import joblib
 import numpy as np
@@ -20,7 +19,7 @@ from src.pipeline.dataset import SequenceConfig, SequenceDataset, build_sequence
 
 def _print(level: str, message: str, *args) -> None:
     formatted = message % args if args else message
-    print(f"[{level}] {formatted}")
+    print(f"[{level}] {formatted}", flush=True)
 
 
 @dataclass
@@ -29,6 +28,35 @@ class TrainerConfig:
     batch_size: int = 32
     learning_rate: float = 1e-3
     device: str = "auto"
+    hidden_size: int = 64
+    num_layers: int = 2
+    dropout: float = 0.1
+    max_batches_per_epoch: Optional[int] = None
+    early_stopping_patience: Optional[int] = 5
+    improvement_threshold: float = 1e-4
+
+    def __post_init__(self) -> None:
+        if self.epochs <= 0:
+            raise ValueError("epochs must be a positive integer")
+        if self.batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer")
+        if self.learning_rate <= 0:
+            raise ValueError("learning_rate must be positive")
+        if self.hidden_size <= 0:
+            raise ValueError("hidden_size must be a positive integer")
+        if self.num_layers <= 0:
+            raise ValueError("num_layers must be a positive integer")
+        if not 0 <= self.dropout < 1:
+            raise ValueError("dropout must be in the range [0, 1)")
+        if self.max_batches_per_epoch is not None and self.max_batches_per_epoch <= 0:
+            raise ValueError("max_batches_per_epoch must be positive when provided")
+        if (
+            self.early_stopping_patience is not None
+            and self.early_stopping_patience <= 0
+        ):
+            raise ValueError("early_stopping_patience must be positive when provided")
+        if self.improvement_threshold < 0:
+            raise ValueError("improvement_threshold must be non-negative")
 
 
 @dataclass
@@ -138,6 +166,11 @@ class LSTMTrainer:
             targets.shape,
         )
         train_dataset, test_dataset = self._split_dataset(sequences, targets)
+        if len(train_dataset) == 0:
+            raise ValueError(
+                "Training dataset is empty after sequence generation. "
+                "Provide more historical data or decrease the lookback window."
+            )
         _print(
             "INFO",
             "Split dataset into %d training samples and %d evaluation samples",
@@ -149,6 +182,9 @@ class LSTMTrainer:
         model = BidirectionalLSTM(
             input_size=sequences.shape[-1],
             output_size=self.sequence_config.horizon,
+            hidden_size=self.trainer_config.hidden_size,
+            num_layers=self.trainer_config.num_layers,
+            dropout=self.trainer_config.dropout,
         )
 
         try:
@@ -168,10 +204,40 @@ class LSTMTrainer:
         criterion = torch.nn.MSELoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=self.trainer_config.learning_rate)
 
+        total_batches = len(train_loader)
+        configured_batch_cap = self.trainer_config.max_batches_per_epoch
+        effective_batches = (
+            total_batches
+            if configured_batch_cap is None
+            else min(total_batches, configured_batch_cap)
+        )
+        if configured_batch_cap is not None and configured_batch_cap < total_batches:
+            _print(
+                "INFO",
+                "Capping each epoch at %d batches (of %d total)",
+                effective_batches,
+                total_batches,
+            )
+        log_interval = max(1, effective_batches // 5) if effective_batches else 1
+
+        best_loss = float("inf")
+        epochs_without_improvement = 0
+
         for epoch in range(self.trainer_config.epochs):
             model.train()
             running_loss = 0.0
-            for batch_features, batch_targets in train_loader:
+            processed_samples = 0
+            processed_batches = 0
+            _print(
+                "DEBUG",
+                "Epoch %d/%d - starting (%d batches)",
+                epoch + 1,
+                self.trainer_config.epochs,
+                effective_batches,
+            )
+            for batch_idx, (batch_features, batch_targets) in enumerate(
+                train_loader, start=1
+            ):
                 batch_features = batch_features.to(self.device)
                 batch_targets = batch_targets.to(self.device)
 
@@ -181,8 +247,44 @@ class LSTMTrainer:
                 loss.backward()
                 optimizer.step()
                 running_loss += loss.item() * batch_features.size(0)
+                processed_samples += batch_features.size(0)
+                processed_batches += 1
 
-            epoch_loss = running_loss / len(train_loader.dataset)
+                if processed_batches % log_interval == 0 or processed_batches == effective_batches:
+                    _print(
+                        "DEBUG",
+                        "Epoch %d/%d - processed %d/%d batches",
+                        epoch + 1,
+                        self.trainer_config.epochs,
+                        processed_batches,
+                        effective_batches,
+                    )
+
+                if (
+                    configured_batch_cap is not None
+                    and processed_batches >= effective_batches
+                ):
+                    if total_batches > effective_batches:
+                        _print(
+                            "DEBUG",
+                            "Epoch %d/%d - reached configured batch limit (%d/%d)",
+                            epoch + 1,
+                            self.trainer_config.epochs,
+                            processed_batches,
+                            total_batches,
+                        )
+                    break
+
+            if processed_samples == 0:
+                _print(
+                    "WARN",
+                    "Epoch %d/%d - no batches processed; stopping training loop",
+                    epoch + 1,
+                    self.trainer_config.epochs,
+                )
+                break
+
+            epoch_loss = running_loss / processed_samples
             _print(
                 "INFO",
                 "Epoch %d/%d - Loss: %.4f",
@@ -190,6 +292,23 @@ class LSTMTrainer:
                 self.trainer_config.epochs,
                 epoch_loss,
             )
+
+            if epoch_loss + self.trainer_config.improvement_threshold < best_loss:
+                best_loss = epoch_loss
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                if (
+                    self.trainer_config.early_stopping_patience is not None
+                    and epochs_without_improvement
+                    >= self.trainer_config.early_stopping_patience
+                ):
+                    _print(
+                        "INFO",
+                        "Early stopping triggered after %d epochs without improvement",
+                        epochs_without_improvement,
+                    )
+                    break
 
         metrics = self.evaluate(model, test_loader, target_scaler)
         _print("INFO", "Evaluation metrics: %s", metrics)
