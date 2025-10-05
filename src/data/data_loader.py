@@ -2,9 +2,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 import pandas as pd
 import yfinance as yf
+from yfinance.shared import _ERRORS
+
+
+YFPricesMissingError = _ERRORS.get("YFPricesMissingError", Exception)
+
+INTRADAY_MAX_LOOKBACK = {
+    "15m": 59,
+}
 
 
 @dataclass
@@ -13,10 +20,28 @@ class YFinanceConfig:
     interval: str = "15m"
     lookback_days: int = 60
 
-    def resolve_start_end(self) -> tuple[datetime, datetime]:
-        end = datetime.utcnow()
-        start = end - timedelta(days=self.lookback_days)
-        return start, end
+    def resolve_period(self) -> str:
+        return f"{self.lookback_days}d"
+
+    def resolved_lookback_days(self) -> int:
+        max_days = INTRADAY_MAX_LOOKBACK.get(self.interval)
+        if max_days is None:
+            return self.lookback_days
+        return min(self.lookback_days, max_days)
+
+    def build_download_kwargs(self) -> dict:
+        lookback_days = self.resolved_lookback_days()
+        if lookback_days != self.lookback_days:
+            period = f"{lookback_days}d"
+        else:
+            period = self.resolve_period()
+        return {
+            "tickers": self.ticker,
+            "interval": self.interval,
+            "period": period,
+            "auto_adjust": False,
+            "progress": False,
+        }
 
 
 class YFinanceLoader:
@@ -26,15 +51,16 @@ class YFinanceLoader:
         self.config = config
 
     def load(self) -> pd.DataFrame:
-        start, end = self.config.resolve_start_end()
-        data = yf.download(
-            tickers=self.config.ticker,
-            interval=self.config.interval,
-            start=start,
-            end=end,
-            auto_adjust=False,
-            progress=False,
-        )
+        kwargs = self.config.build_download_kwargs()
+        try:
+            data = yf.download(**kwargs)
+        except YFPricesMissingError:
+            max_days = INTRADAY_MAX_LOOKBACK.get(self.config.interval)
+            if max_days is None or kwargs["period"] == f"{max_days}d":
+                raise
+            data = yf.download(
+                **kwargs | {"period": f"{max_days}d"}
+            )
         if data.empty:
             raise ValueError(
                 f"No data returned from yfinance for ticker {self.config.ticker}"
